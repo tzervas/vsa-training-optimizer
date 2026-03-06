@@ -36,7 +36,10 @@ class PredictionConfig:
     prediction_steps: int = 4  # Steps to predict before correction
     momentum: float = 0.9  # Momentum for gradient prediction
     correction_weight: float = 0.5  # Weight for correction term
-    min_correlation: float = 0.8  # Minimum correlation for prediction
+    min_correlation: float = 0.9  # Minimum correlation for prediction
+    prediction_scale: float = 0.25  # Scale applied to predicted gradients
+    residual_weight: float = 0.25  # Weight for residual trend correction
+    residual_decay: float = 0.9  # EMA decay for residuals
 
 
 class GradientPredictor:
@@ -91,6 +94,7 @@ class GradientPredictor:
         self.total_steps = 0
         self.last_prediction: dict[str, Tensor] = {}
         self.correction_accumulator: dict[str, Tensor] = {}
+        self.residual_ema: dict[str, Tensor] = {}
 
         # Statistics for adaptive prediction
         self.prediction_errors: deque[float] = deque(maxlen=100)
@@ -108,7 +112,7 @@ class GradientPredictor:
         3. When prediction quality degrades below threshold
         """
         # Need full gradient at start for history
-        if len(next(iter(self.gradient_history.values()))) < 2:
+        if len(next(iter(self.gradient_history.values()))) < self.config.history_size:
             return True
 
         # Need correction after prediction_steps
@@ -164,7 +168,27 @@ class GradientPredictor:
                 g_prev = history[-2]
                 g_curr = history[-1]
                 delta = g_curr - g_prev
-                predicted[name] = g_curr + momentum * delta
+                # Use correlation-aware extrapolation for stability
+                try:
+                    sim = nn.functional.cosine_similarity(
+                        g_curr.flatten(),
+                        g_prev.flatten(),
+                        dim=0,
+                        eps=1e-8,
+                    ).item()
+                except Exception:
+                    sim = 0.0
+
+                base = g_curr.clone()
+                if sim >= self.config.min_correlation:
+                    base = base + momentum * delta
+
+                residual = self.residual_ema.get(name)
+                if residual is not None:
+                    base = base + self.config.residual_weight * residual
+
+                predicted[name] = base
+                self.correlation_estimates[name] = sim
 
         self.last_prediction = predicted
         self.steps_since_full += 1
@@ -183,10 +207,15 @@ class GradientPredictor:
         """
         for name, param in self.model.named_parameters():
             if name in predicted and predicted[name] is not None:
+                scale = 1.0
+                corr = self.correlation_estimates.get(name)
+                if corr is not None and corr < self.config.min_correlation:
+                    scale = max(corr, 0.0) / max(self.config.min_correlation, 1e-6)
+                grad = predicted[name] * (self.config.prediction_scale * scale)
                 if param.grad is None:
-                    param.grad = predicted[name].clone()
+                    param.grad = grad.clone()
                 else:
-                    param.grad.copy_(predicted[name])
+                    param.grad.copy_(grad)
 
     def compute_correction(self) -> dict[str, Tensor]:
         """Compute correction between predicted and actual gradients.
@@ -213,6 +242,15 @@ class GradientPredictor:
                     self.prediction_errors.append(error)
 
                     corrections[name] = correction
+
+                    # Track residual trend with EMA for future predictions
+                    if name not in self.residual_ema:
+                        self.residual_ema[name] = correction.clone()
+                    else:
+                        self.residual_ema[name].mul_(self.config.residual_decay).add_(
+                            correction,
+                            alpha=1 - self.config.residual_decay,
+                        )
 
                     # Accumulate for later application
                     if name not in self.correction_accumulator:

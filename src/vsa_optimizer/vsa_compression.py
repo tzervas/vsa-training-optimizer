@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+import hashlib
 
 import torch
 from torch import Tensor
@@ -107,6 +108,7 @@ class VSAConfig:
     compression_ratio: float = 0.1  # Target compression ratio
     use_ternary: bool = True  # Use ternary quantization
     seed: int = 42  # Random seed for reproducibility
+    key_seed: int = 1337  # Seed for deterministic binding keys
 
 
 class VSAGradientCompressor:
@@ -156,7 +158,45 @@ class VSAGradientCompressor:
         self.generator.manual_seed(self.config.seed)
 
         # Cache for projection chunks
-        self._projection_cache: dict[int, Tensor] = {}
+        self._projection_cache: dict[tuple[int, int], Tensor] = {}
+        self._key_cache: dict[tuple[str, torch.device, torch.dtype], Tensor] = {}
+
+    def _get_key_vector(
+        self,
+        name: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Get or generate a deterministic binding key for a gradient name.
+
+        Why: Proper VSA bundling requires binding each tensor with a unique,
+        deterministic key so that unbinding can recover the original component.
+        """
+        cache_key = (name, device, dtype)
+        if cache_key in self._key_cache:
+            return self._key_cache[cache_key]
+
+        # Stable hash to keep keys deterministic across runs
+        name_hash = int.from_bytes(
+            hashlib.sha256(f"{self.config.key_seed}:{name}".encode("utf-8")).digest()[:4],
+            "little",
+        )
+        key_gen = torch.Generator(device=device)
+        key_gen.manual_seed(self.config.key_seed + name_hash)
+
+        # Use bipolar keys {-1, +1} for self-inverse binding
+        key = torch.randint(
+            low=0,
+            high=2,
+            size=(self.compressed_dim,),
+            generator=key_gen,
+            device=device,
+            dtype=torch.int8,
+        ).to(dtype=dtype)
+        key = key * 2 - 1
+
+        self._key_cache[cache_key] = key
+        return key
 
     def _get_projection_chunk(self, chunk_idx: int, chunk_size: int, device: torch.device) -> Tensor:
         """Get or generate projection matrix for a chunk.
@@ -203,7 +243,7 @@ class VSAGradientCompressor:
         if isinstance(gradients, dict):
             gradients = gradients.items()
 
-        compressed = None
+        bound_vectors: list[Tensor] = []
         metadata: dict[str, tuple[int, float]] = {}
         offset = 0
 
@@ -226,20 +266,19 @@ class VSAGradientCompressor:
             else:
                 scale = 1.0
 
-            # Bundle into compressed representation
-            if compressed is None:
-                compressed = projected
-            else:
-                compressed = compressed + projected
+            # Bind with a deterministic key before bundling
+            key = self._get_key_vector(name, projected.device, projected.dtype)
+            bound = hyperdimensional_bind(projected, key)
+            bound_vectors.append(bound)
 
             metadata[name] = (offset, scale)
             offset += size
 
-        if compressed is None:
+        if not bound_vectors:
             raise ValueError("No gradients to compress")
 
-        # Normalize bundled result
-        compressed = compressed / len(metadata)
+        # Bundle bound vectors into a single superposition
+        compressed = hyperdimensional_bundle(bound_vectors)
 
         return compressed, metadata
 
@@ -272,8 +311,12 @@ class VSAGradientCompressor:
             # Get projection for this chunk
             proj = self._get_projection_chunk(offset, size, compressed.device)
 
+            # Unbind the requested component before inverse projection
+            key = self._get_key_vector(name, compressed.device, compressed.dtype)
+            unbound = hyperdimensional_bind(compressed, key)
+
             # Inverse projection (pseudo-inverse via transpose)
-            reconstructed = compressed @ proj.T  # (size,)
+            reconstructed = unbound @ proj.T  # (size,)
 
             # Apply scale
             if scale != 0:

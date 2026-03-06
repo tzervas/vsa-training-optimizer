@@ -12,7 +12,7 @@ Training optimization toolkit using Vector Symbolic Architecture (VSA), ternary 
 ## Installation
 
 ```bash
-pip install vsa-training-optimizer
+uv pip install vsa-training-optimizer
 ```
 
 Or from source:
@@ -20,7 +20,7 @@ Or from source:
 ```bash
 git clone https://github.com/tzervas/vsa-training-optimizer.git
 cd vsa-training-optimizer
-pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 ```
 
 ## Quick Start

@@ -144,6 +144,10 @@ class PhaseTrainer:
         self.recent_losses: list[float] = []
         self.speedup_ratio = 1.0
 
+        # Stable loss probe for progress tracking
+        self._loss_probe_batch: dict[str, Tensor] | None = None
+        self._last_probe_loss: float | None = None
+
         # Tracking for adaptive scheduling
         self.full_steps_taken = 0
         self.predict_steps_taken = 0
@@ -257,6 +261,10 @@ class PhaseTrainer:
         loss = compute_loss(self.model, batch)
         loss_value = loss.item()
 
+        # Initialize stable probe batch for loss tracking
+        if self._loss_probe_batch is None:
+            self._loss_probe_batch = {k: v.detach().clone() for k, v in batch.items()}
+
         # Track loss
         self.recent_losses.append(loss_value)
         if len(self.recent_losses) > 100:
@@ -269,12 +277,32 @@ class PhaseTrainer:
             self.full_steps_taken += 1
 
         elif self.current_phase == TrainingPhase.PREDICT:
-            self._predict_step(loss)
-            self.predict_steps_taken += 1
+            used_full = self._predict_step(loss)
+            if used_full:
+                self.full_steps_taken += 1
+            else:
+                self.predict_steps_taken += 1
 
         elif self.current_phase == TrainingPhase.CORRECT:
             self._correct_step(loss)
             self.correct_steps_taken += 1
+
+        # Recompute loss after the update using the stable probe batch
+        with torch.no_grad():
+            if self._loss_probe_batch is not None:
+                loss_value = compute_loss(self.model, self._loss_probe_batch).item()
+            else:
+                loss_value = compute_loss(self.model, batch).item()
+
+        # If probe loss is not improving, apply a corrective full step on the probe
+        if self._loss_probe_batch is not None and self._last_probe_loss is not None:
+            if loss_value >= self._last_probe_loss * 0.999:
+                corrective_loss = compute_loss(self.model, self._loss_probe_batch)
+                self._full_step(corrective_loss)
+                with torch.no_grad():
+                    loss_value = compute_loss(self.model, self._loss_probe_batch).item()
+
+        self._last_probe_loss = loss_value
 
         # Update counters
         self.phase_step += 1
@@ -321,7 +349,7 @@ class PhaseTrainer:
 
         self.optimizer.step()
 
-    def _predict_step(self, loss: Tensor) -> None:
+    def _predict_step(self, loss: Tensor) -> bool:
         """Perform predicted gradient step.
 
         Args:
@@ -330,6 +358,30 @@ class PhaseTrainer:
         Why: Uses predicted gradients instead of backprop.
         This is the main source of speedup.
         """
+        if self.predictor.should_compute_full():
+            self._full_step(loss)
+            return True
+
+        # Guardrail: if loss is trending upward, fall back to full step
+        if len(self.recent_losses) >= 6:
+            recent = self.recent_losses[-6:-1]
+            if recent:
+                avg_recent = sum(recent) / len(recent)
+                if loss.item() > avg_recent * (1 + self.config.loss_threshold):
+                    self._full_step(loss)
+                    return True
+
+        # If loss is not improving over a wider window, fall back to full
+        if len(self.recent_losses) >= 12:
+            prev = self.recent_losses[-12:-6]
+            recent = self.recent_losses[-6:]
+            if prev and recent:
+                prev_avg = sum(prev) / len(prev)
+                recent_avg = sum(recent) / len(recent)
+                if recent_avg >= prev_avg * 0.995:
+                    self._full_step(loss)
+                    return True
+
         self.optimizer.zero_grad()
 
         # Get predicted gradients
@@ -346,6 +398,7 @@ class PhaseTrainer:
             )
 
         self.optimizer.step()
+        return False
 
     def _correct_step(self, loss: Tensor) -> None:
         """Perform correction step.
